@@ -1205,7 +1205,7 @@ Need a managed endpoint so ChatGPT (or any MCP-aware assistant) can talk to Alpa
 2. `railway up --service alpaca-mcp-server`
 3. Set the required variables (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, optional `ALPACA_PAPER_TRADE`) via `railway variables --service alpaca-mcp-server --set ...`
 
-The container listens on `0.0.0.0:$PORT` using MCP's HTTP transport automatically. Once deployed, add the service to ChatGPT’s MCP configuration:
+The container listens on `0.0.0.0:$PORT` using MCP's HTTP transport automatically and exposes `GET /healthz` for platform health checks (via uvicorn factory start). Once deployed, add the service to ChatGPT’s MCP configuration:
 
 ```jsonc
 {

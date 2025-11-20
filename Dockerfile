@@ -9,4 +9,5 @@ COPY .github/core .github/core
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir .
 
-CMD ["sh", "-c", "alpaca-mcp-server serve --transport streamable-http --host 0.0.0.0 --port ${PORT:-8080}"]
+# Run via uvicorn factory to expose health/manifest endpoints reliably
+CMD ["uvicorn", "alpaca_mcp_server.server:_build_http_server_app", "--factory", "--host", "0.0.0.0", "--port", "${PORT:-8080}"]

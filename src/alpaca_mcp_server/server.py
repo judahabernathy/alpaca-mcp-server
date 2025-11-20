@@ -21,10 +21,15 @@ import sys
 import time
 import argparse
 from datetime import datetime, timedelta, date
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Callable, Awaitable
 from pathlib import Path
 
 from dotenv import load_dotenv
+from alpaca_mcp_server import __version__
+from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.requests import Request
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
 
 from alpaca.common.enums import SupportedCurrencies
 from alpaca.common.exceptions import APIError
@@ -186,6 +191,70 @@ log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
 
 # Initialize FastMCP server
 mcp = FastMCP("alpaca-trading", log_level=log_level)
+
+# Minimal HTTP endpoints for platform health and MCP discovery
+def _build_manifest(base_url: str) -> dict[str, object]:
+    return {
+        "schemaVersion": "1.0",
+        "name": "alpaca-mcp-server",
+        "version": __version__,
+        "description": "Alpaca Trading API integration for Model Context Protocol (stocks, options, crypto, portfolio).",
+        "homepage": "https://github.com/alpacahq/alpaca-mcp-server",
+        "transport": {
+            "type": "http",
+            "endpoint": f"{base_url.rstrip('/')}/mcp",
+        },
+        "links": {
+            "documentation": "https://github.com/alpacahq/alpaca-mcp-server#readme",
+        },
+    }
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+@mcp.custom_route("/health", methods=["GET"])
+@mcp.custom_route("/readyz", methods=["GET"])
+@mcp.custom_route("/mcp/healthz", methods=["GET"])
+async def _health_endpoint(_request: Request):
+    return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/.well-known/mcp/manifest.json", methods=["GET"])
+@mcp.custom_route("/.well-known/mcp/manifest", methods=["GET"])
+async def _manifest_endpoint(request: Request):
+    host = request.headers.get("host") or "localhost"
+    scheme = "https" if os.getenv("PUBLIC_HTTPS", "true").lower() != "false" or os.getenv("RAILWAY_ENVIRONMENT") else "http"
+    base_url = f"{scheme}://{host}"
+    return JSONResponse(_build_manifest(base_url))
+
+
+def _build_http_server_app() -> Starlette:
+    """
+    Compose a Starlette app that layers health/manifest on top of the MCP streamable HTTP app and
+    propagates Authorization headers for downstream Alpaca SDK calls.
+    """
+    base_app = mcp.streamable_http_app()
+    auth_wrapped = _build_http_wrapper(base_app)
+
+    async def _health(request: Request):
+        return PlainTextResponse("ok")
+
+    async def _manifest(request: Request):
+        host = request.headers.get("host") or "localhost"
+        scheme = request.url.scheme or "https"
+        return JSONResponse(_build_manifest(f"{scheme}://{host}"))
+
+    routes = [
+        Route("/healthz", _health),
+        Route("/health", _health),
+        Route("/readyz", _health),
+        Route("/mcp/healthz", _health),
+        Route("/.well-known/mcp/manifest.json", _manifest),
+        Route("/.well-known/mcp/manifest", _manifest),
+        Mount("/mcp", app=auth_wrapped),
+    ]
+    app = Starlette(routes=routes)
+    print(f"[mcp-debug] registered http routes: {[r.path for r in routes]}", file=sys.stderr)
+    return app
 
 # Convert string to boolean
 ALPACA_PAPER_TRADE_BOOL = ALPACA_PAPER_TRADE.lower() not in ['false', '0', 'no', 'off']
@@ -2887,35 +2956,23 @@ def parse_arguments() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     return p.parse_args()
 
-class AuthHeaderMiddleware:
+def _build_http_wrapper(base_app: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
     """
-    ASGI middleware to extract Authorization headers from incoming HTTP requests.
-    
-    This middleware intercepts HTTP requests, extracts the Authorization header,
-    and stores it in a context variable. The header is then passed along to
-    Alpaca Trading API calls.
+    Wrap the MCP ASGI app to propagate Authorization headers for downstream Alpaca requests.
     """
-    def __init__(self, app):
-        self.app = app
-    
-    async def __call__(self, scope, receive, send):
-        """Process ASGI request and extract Authorization header."""
+    async def _auth_wrapper(scope, receive, send):
         if scope["type"] == "http":
-            # Extract Authorization header
-            headers = dict(scope.get("headers", []))
+            headers = dict(scope.get("headers") or [])
             auth_header = headers.get(b"authorization") or headers.get(b"Authorization")
-            
             if auth_header:
-                auth_value = auth_header.decode("utf-8")
-                # Store the full Authorization header value (e.g., "Bearer <token>")
-                auth_header_context.set(auth_value)
-        
-        # Call the wrapped application
+                auth_header_context.set(auth_header.decode("utf-8"))
         try:
-            await self.app(scope, receive, send)
+            await base_app(scope, receive, send)
         finally:
-            # Clear auth header from context after request
-            auth_header_context.set(None)
+            if scope["type"] == "http":
+                auth_header_context.set(None)
+
+    return _auth_wrapper
 
 
 class AlpacaMCPServer:
@@ -2952,24 +3009,19 @@ class AlpacaMCPServer:
             # Configure FastMCP settings for host/port with current MCP versions
             mcp.settings.host = host
             mcp.settings.port = port
-            
-            # Try to wrap the MCP app with auth header middleware for HTTP transport
-            # This enables extracting the Authorization header from incoming requests
-            # and passing it along to Alpaca Trading API calls
-            try:
-                # Get the underlying ASGI application
-                if hasattr(mcp, '_app'):
-                    original_app = mcp._app
-                    mcp._app = AuthHeaderMiddleware(original_app)
-                elif hasattr(mcp, 'app'):
-                    original_app = mcp.app
-                    mcp.app = AuthHeaderMiddleware(original_app)
-            except Exception as e:
-                # If we can't wrap the app, log a warning but continue
-                print(f"Note: Could not apply AuthHeaderMiddleware: {e}", file=sys.stderr)
-                print("Authorization header passthrough may not work correctly", file=sys.stderr)
-            
-            mcp.run(transport="streamable-http")
+
+            # Build composite Starlette app with health/manifest + MCP HTTP handlers
+            app = _build_http_server_app()
+            import uvicorn
+
+            print(f"[mcp-debug] launching uvicorn on {host}:{port}", file=sys.stderr)
+            uvicorn.run(
+                app,
+                host=host,
+                port=port,
+                log_level=(mcp.settings.log_level or "info").lower(),
+                lifespan="auto",
+            )
         else:
             mcp.run(transport="stdio")
 
