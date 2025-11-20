@@ -190,7 +190,7 @@ log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
 # Initialize FastMCP server
 mcp = FastMCP("alpaca-trading", log_level=log_level)
 
-def _build_http_server_app() -> Starlette:
+def _build_http_server_app():
     """
     Compose a Starlette app that layers health/manifest on top of the MCP streamable HTTP app and
     propagates Authorization headers for downstream Alpaca SDK calls.
