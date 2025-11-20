@@ -2976,13 +2976,20 @@ def _build_http_wrapper(base_app: Callable[..., Awaitable[None]]) -> Callable[..
     Wrap the MCP ASGI app to propagate Authorization headers for downstream Alpaca requests.
     """
     async def _auth_wrapper(scope, receive, send):
+        # Normalize path for the underlying MCP app (expects /mcp)
+        mod_scope = dict(scope)
+        path = mod_scope.get("path") or ""
+        if path in {"/", ""}:
+            mod_scope["path"] = "/mcp"
+            mod_scope["raw_path"] = b"/mcp"
+
         if scope["type"] == "http":
             headers = dict(scope.get("headers") or [])
             auth_header = headers.get(b"authorization") or headers.get(b"Authorization")
             if auth_header:
                 auth_header_context.set(auth_header.decode("utf-8"))
         try:
-            await base_app(scope, receive, send)
+            await base_app(mod_scope, receive, send)
         finally:
             if scope["type"] == "http":
                 auth_header_context.set(None)
