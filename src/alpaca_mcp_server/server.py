@@ -251,8 +251,8 @@ def _build_http_server_app() -> Starlette:
             if auth_header:
                 auth_header_context.set(auth_header)
             mod_scope = dict(scope)
-            mod_scope["path"] = path
-            mod_scope["raw_path"] = path.encode("utf-8")
+            mod_scope["path"] = "/mcp"
+            mod_scope["raw_path"] = b"/mcp"
             try:
                 await base_app(mod_scope, receive, send)
             finally:
