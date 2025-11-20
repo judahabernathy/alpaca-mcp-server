@@ -28,8 +28,6 @@ from dotenv import load_dotenv
 from alpaca_mcp_server import __version__
 from starlette.responses import PlainTextResponse, JSONResponse
 from starlette.requests import Request
-from starlette.applications import Starlette
-from starlette.routing import Route, Mount
 
 from alpaca.common.enums import SupportedCurrencies
 from alpaca.common.exceptions import APIError
@@ -192,83 +190,82 @@ log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
 # Initialize FastMCP server
 mcp = FastMCP("alpaca-trading", log_level=log_level)
 
-# Minimal HTTP endpoints for platform health and MCP discovery
-def _build_manifest(base_url: str) -> dict[str, object]:
-    return {
-        "schemaVersion": "1.0",
-        "name": "alpaca-mcp-server",
-        "version": __version__,
-        "description": "Alpaca Trading API integration for Model Context Protocol (stocks, options, crypto, portfolio).",
-        "homepage": "https://github.com/alpacahq/alpaca-mcp-server",
-        "transport": {
-            "type": "http",
-            "endpoint": f"{base_url.rstrip('/')}/mcp",
-        },
-        "links": {
-            "documentation": "https://github.com/alpacahq/alpaca-mcp-server#readme",
-        },
-    }
-
-
-@mcp.custom_route("/healthz", methods=["GET"])
-@mcp.custom_route("/health", methods=["GET"])
-@mcp.custom_route("/readyz", methods=["GET"])
-@mcp.custom_route("/mcp/healthz", methods=["GET"])
-async def _health_endpoint(_request: Request):
-    return PlainTextResponse("ok")
-
-
-@mcp.custom_route("/.well-known/mcp/manifest.json", methods=["GET"])
-@mcp.custom_route("/.well-known/mcp/manifest", methods=["GET"])
-async def _manifest_endpoint(request: Request):
-    host = request.headers.get("host") or "localhost"
-    scheme = "https" if os.getenv("PUBLIC_HTTPS", "true").lower() != "false" or os.getenv("RAILWAY_ENVIRONMENT") else "http"
-    base_url = f"{scheme}://{host}"
-    return JSONResponse(_build_manifest(base_url))
-
-
 def _build_http_server_app() -> Starlette:
     """
     Compose a Starlette app that layers health/manifest on top of the MCP streamable HTTP app and
     propagates Authorization headers for downstream Alpaca SDK calls.
     """
     base_app = mcp.streamable_http_app()
-    auth_wrapped = _build_http_wrapper(base_app)
 
-    def _resolve_scheme(request: Request) -> str:
-        forwarded = request.headers.get("x-forwarded-proto")
+    def _resolve_scheme(headers: dict[str, str]) -> str:
+        forwarded = headers.get("x-forwarded-proto")
         if forwarded:
             return forwarded.split(",")[0].strip() or "https"
-        # Railway + most proxies strip the scheme on url; prefer https for *.railway.app
-        host = request.headers.get("host", "")
+        host = headers.get("host", "")
         if host.endswith(".railway.app"):
             return "https"
-        return request.url.scheme or "https"
+        return "https"
 
-    async def _health(request: Request):
-        return PlainTextResponse("ok")
+    def _build_manifest(base_url: str) -> dict[str, object]:
+        return {
+            "schemaVersion": "1.0",
+            "name": "alpaca-mcp-server",
+            "version": __version__,
+            "description": "Alpaca Trading API integration for Model Context Protocol (stocks, options, crypto, portfolio).",
+            "homepage": "https://github.com/alpacahq/alpaca-mcp-server",
+            "transport": {
+                "type": "http",
+                "endpoint": f"{base_url.rstrip('/')}/mcp",
+            },
+            "links": {
+                "documentation": "https://github.com/alpacahq/alpaca-mcp-server#readme",
+            },
+        }
 
-    async def _manifest(request: Request):
-        host = request.headers.get("host") or "localhost"
-        scheme = _resolve_scheme(request)
-        if "railway.app" in host:
-            scheme = "https"
-        return JSONResponse(_build_manifest(f"{scheme}://{host}"))
+    async def app(scope, receive, send):
+        if scope["type"] != "http":
+            await base_app(scope, receive, send)
+            return
 
-    routes = [
-        Route("/healthz", _health),
-        Route("/health", _health),
-        Route("/readyz", _health),
-        Route("/mcp/healthz", _health),
-        Route("/.well-known/mcp/manifest.json", _manifest),
-        Route("/.well-known/mcp/manifest", _manifest),
-        # Primary MCP endpoint
-        Mount("/mcp", app=auth_wrapped),
-        # Handle trailing slash for clients that append it to the MCP endpoint
-        Mount("/mcp/", app=auth_wrapped),
-    ]
-    app = Starlette(routes=routes, redirect_slashes=False)
-    print(f"[mcp-debug] registered http routes: {[r.path for r in routes]}", file=sys.stderr)
+        path = scope.get("path") or ""
+        headers_bytes = dict(scope.get("headers") or [])
+        headers = {k.decode("utf-8"): v.decode("utf-8") for k, v in headers_bytes.items()}
+
+        # Health checks
+        if path in {"/healthz", "/health", "/readyz", "/mcp/healthz"}:
+            response = PlainTextResponse("ok")
+            await response(scope, receive, send)
+            return
+
+        # Manifest
+        if path in {"/.well-known/mcp/manifest.json", "/.well-known/mcp/manifest"}:
+            host = headers.get("host") or "localhost"
+            base_url = f"{_resolve_scheme(headers)}://{host}"
+            response = JSONResponse(_build_manifest(base_url))
+            await response(scope, receive, send)
+            return
+
+        # MCP transport (accept /mcp and /mcp/)
+        if path.startswith("/mcp"):
+            auth_header = headers.get("authorization")
+            if auth_header:
+                auth_header_context.set(auth_header)
+            subpath = path[len("/mcp"):] or "/"
+            if not subpath.startswith("/"):
+                subpath = "/" + subpath
+            mod_scope = dict(scope)
+            mod_scope["path"] = subpath
+            mod_scope["raw_path"] = subpath.encode("utf-8")
+            try:
+                await base_app(mod_scope, receive, send)
+            finally:
+                auth_header_context.set(None)
+            return
+
+        # Fallback 404
+        response = PlainTextResponse("not found", status_code=404)
+        await response(scope, receive, send)
+
     return app
 
 # Convert string to boolean
