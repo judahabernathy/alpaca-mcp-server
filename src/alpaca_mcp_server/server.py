@@ -263,6 +263,8 @@ def _build_http_server_app() -> Starlette:
         Route("/.well-known/mcp/manifest.json", _manifest),
         Route("/.well-known/mcp/manifest", _manifest),
         Mount("/mcp", app=auth_wrapped),
+        # Accept trailing slash for clients that append it to the MCP endpoint
+        Mount("/mcp/", app=auth_wrapped),
     ]
     app = Starlette(routes=routes)
     print(f"[mcp-debug] registered http routes: {[r.path for r in routes]}", file=sys.stderr)
