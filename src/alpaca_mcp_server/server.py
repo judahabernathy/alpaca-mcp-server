@@ -2980,8 +2980,11 @@ def _build_http_wrapper(base_app: Callable[..., Awaitable[None]]) -> Callable[..
         mod_scope = dict(scope)
         path = mod_scope.get("path") or ""
         if path in {"/", ""}:
-            mod_scope["path"] = "/mcp"
-            mod_scope["raw_path"] = b"/mcp"
+            norm = "/"
+        else:
+            norm = path.rstrip("/") or "/"
+        mod_scope["path"] = norm
+        mod_scope["raw_path"] = norm.encode("utf-8")
 
         if scope["type"] == "http":
             headers = dict(scope.get("headers") or [])
