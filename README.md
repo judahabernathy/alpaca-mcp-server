@@ -1197,6 +1197,34 @@ Update your Claude Desktop configuration to use HTTP:
 
 </details>
 
+## Railway + ChatGPT Deployment (SwingGPT Stack)
+
+Need a managed endpoint so ChatGPT (or any MCP-aware assistant) can talk to Alpaca from anywhere? Deploy this repo to Railway with the provided `Dockerfile`:
+
+1. `railway link --project swinggpt-stack --environment production`
+2. `railway up --service alpaca-mcp-server`
+3. Set the required variables (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, optional `ALPACA_PAPER_TRADE`) via `railway variables --service alpaca-mcp-server --set ...`
+
+The container listens on `0.0.0.0:$PORT` using MCP's HTTP transport automatically. Once deployed, add the service to ChatGPT’s MCP configuration:
+
+```jsonc
+{
+  "mcpServers": {
+    "alpaca": {
+      "type": "http",
+      "url": "https://alpaca-mcp-server-production.up.railway.app/mcp",
+      "env": {
+        "ALPACA_API_KEY": "<PK...>",
+        "ALPACA_SECRET_KEY": "<SK...>",
+        "ALPACA_PAPER_TRADE": "True"
+      }
+    }
+  }
+}
+```
+
+> Tip: Rotate keys regularly. Paper accounts work great for SIM mode; flip `ALPACA_PAPER_TRADE` to `False` only when you intend to route live orders.
+
 ## Troubleshooting
 
 - **uv/uvx not found**: Install uv from the official guide (https://docs.astral.sh/uv/getting-started/installation/) and then restart your terminal so `uv`/`uvx` are on PATH.
