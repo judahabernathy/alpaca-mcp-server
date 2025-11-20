@@ -2978,8 +2978,8 @@ def _build_http_wrapper(base_app: Callable[..., Awaitable[None]]) -> Callable[..
     async def _auth_wrapper(scope, receive, send):
         # Normalize path for the underlying MCP app (expects /mcp)
         mod_scope = dict(scope)
-        mod_scope["path"] = "/mcp"
-        mod_scope["raw_path"] = b"/mcp"
+        mod_scope["path"] = "/"
+        mod_scope["raw_path"] = b"/"
 
         if scope["type"] == "http":
             headers = dict(scope.get("headers") or [])
