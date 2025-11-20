@@ -262,11 +262,12 @@ def _build_http_server_app() -> Starlette:
         Route("/mcp/healthz", _health),
         Route("/.well-known/mcp/manifest.json", _manifest),
         Route("/.well-known/mcp/manifest", _manifest),
+        # Primary MCP endpoint
         Mount("/mcp", app=auth_wrapped),
-        # Accept trailing slash for clients that append it to the MCP endpoint
+        # Handle trailing slash for clients that append it to the MCP endpoint
         Mount("/mcp/", app=auth_wrapped),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(routes=routes, redirect_slashes=False)
     print(f"[mcp-debug] registered http routes: {[r.path for r in routes]}", file=sys.stderr)
     return app
 
