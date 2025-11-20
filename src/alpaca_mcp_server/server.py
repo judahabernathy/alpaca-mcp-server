@@ -235,12 +235,22 @@ def _build_http_server_app() -> Starlette:
     base_app = mcp.streamable_http_app()
     auth_wrapped = _build_http_wrapper(base_app)
 
+    def _resolve_scheme(request: Request) -> str:
+        forwarded = request.headers.get("x-forwarded-proto")
+        if forwarded:
+            return forwarded.split(",")[0].strip() or "https"
+        # Railway + most proxies strip the scheme on url; prefer https for *.railway.app
+        host = request.headers.get("host", "")
+        if host.endswith(".railway.app"):
+            return "https"
+        return request.url.scheme or "https"
+
     async def _health(request: Request):
         return PlainTextResponse("ok")
 
     async def _manifest(request: Request):
         host = request.headers.get("host") or "localhost"
-        scheme = request.url.scheme or "https"
+        scheme = _resolve_scheme(request)
         return JSONResponse(_build_manifest(f"{scheme}://{host}"))
 
     routes = [
