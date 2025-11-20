@@ -251,6 +251,8 @@ def _build_http_server_app() -> Starlette:
     async def _manifest(request: Request):
         host = request.headers.get("host") or "localhost"
         scheme = _resolve_scheme(request)
+        if "railway.app" in host:
+            scheme = "https"
         return JSONResponse(_build_manifest(f"{scheme}://{host}"))
 
     routes = [
