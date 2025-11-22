@@ -20,14 +20,17 @@ import re
 import sys
 import time
 import argparse
+import uuid
 from datetime import datetime, timedelta, date
 from typing import Dict, Any, List, Optional, Union, Callable, Awaitable
 from pathlib import Path
 
 from dotenv import load_dotenv
 from alpaca_mcp_server import __version__
+from starlette.applications import Starlette
 from starlette.responses import PlainTextResponse, JSONResponse
 from starlette.requests import Request
+from starlette.routing import Route
 
 from alpaca.common.enums import SupportedCurrencies
 from alpaca.common.exceptions import APIError
@@ -188,7 +191,13 @@ log_level = "ERROR" if is_pycharm else "INFO"
 log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
 
 # Initialize FastMCP server
-mcp = FastMCP("alpaca-trading", log_level=log_level)
+mcp = FastMCP(
+    "alpaca-trading",
+    log_level=log_level,
+    # Stateless + JSON responses so MCP clients don't need session headers or SSE Accept.
+    stateless_http=True,
+    json_response=True,
+)
 
 def _build_http_server_app():
     """
@@ -196,6 +205,7 @@ def _build_http_server_app():
     propagates Authorization headers for downstream Alpaca SDK calls.
     """
     base_app = mcp.streamable_http_app()
+    bridge_app = Starlette(routes=_BRIDGE_ROUTES)
 
     def _resolve_scheme(headers: dict[str, str]) -> str:
         forwarded = headers.get("x-forwarded-proto")
@@ -237,12 +247,24 @@ def _build_http_server_app():
             await response(scope, receive, send)
             return
 
-        # Manifest
-        if path in {"/.well-known/mcp/manifest.json", "/.well-known/mcp/manifest"}:
+        # Manifest / discovery (serve on common paths, including root, for remote clients)
+        manifest_paths = {
+            "/",
+            "/.well-known/mcp.json",
+            "/.well-known/mcp",
+            "/.well-known/mcp/manifest.json",
+            "/.well-known/mcp/manifest",
+        }
+        if path in manifest_paths:
             host = headers.get("host") or "localhost"
             base_url = f"{_resolve_scheme(headers)}://{host}"
             response = JSONResponse(_build_manifest(base_url))
             await response(scope, receive, send)
+            return
+
+        # JSON bridge endpoints (Ops-Hub integration via HTTP/JSON)
+        if path.startswith("/v2") or path.startswith("/account") or path.startswith("/positions") or path.startswith("/orders") or path.startswith("/watchlists") or path.startswith("/stocks/"):
+            await bridge_app(scope, receive, send)
             return
 
         # MCP transport (accept /mcp and /mcp/)
@@ -251,8 +273,20 @@ def _build_http_server_app():
             if auth_header:
                 auth_header_context.set(auth_header)
             mod_scope = dict(scope)
+            # Normalize to /mcp for FastMCP and ensure Accept header allows JSON.
             mod_scope["path"] = "/mcp"
             mod_scope["raw_path"] = b"/mcp"
+            new_headers = []
+            has_accept = False
+            for key, value in list(scope.get("headers") or []):
+                if key.lower() == b"accept":
+                    has_accept = True
+                    if b"application/json" not in value.lower():
+                        value = b"application/json"
+                new_headers.append((key, value))
+            if not has_accept:
+                new_headers.append((b"accept", b"application/json"))
+            mod_scope["headers"] = new_headers
             try:
                 await base_app(mod_scope, receive, send)
             finally:
@@ -339,6 +373,239 @@ def _ensure_clients():
         corporate_actions_client = CorporateActionsClientSigned(api_key=TRADE_API_KEY, secret_key=TRADE_API_SECRET)
         crypto_historical_data_client = CryptoHistoricalDataClientSigned(api_key=TRADE_API_KEY, secret_key=TRADE_API_SECRET)
         _clients_initialized = True
+
+
+def _serialize(obj):
+    """Best-effort conversion of Alpaca SDK models into JSON-serialisable payloads."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, list):
+        return [_serialize(item) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    for attr in ("model_dump", "dict"):
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                return _serialize(fn())
+            except Exception:
+                pass
+    for attr in ("json", "model_dump_json", "to_json"):
+        fn = getattr(obj, attr, None)
+        if callable(fn):
+            try:
+                return _serialize(json.loads(fn()))
+            except Exception:
+                pass
+    try:
+        return json.loads(json.dumps(obj, default=str))
+    except Exception:
+        return str(obj)
+
+
+# Lightweight JSON bridge endpoints used by Ops-Hub (replacing legacy Alpaca Edge HTTP access).
+async def _bridge_account(request: Request) -> JSONResponse:
+    _ensure_clients()
+    try:
+        account = trade_client.get_account()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(account))
+
+
+async def _bridge_positions(request: Request) -> JSONResponse:
+    _ensure_clients()
+    try:
+        positions = trade_client.get_all_positions()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(positions))
+
+
+async def _bridge_position_by_symbol(request: Request) -> JSONResponse:
+    _ensure_clients()
+    symbol = request.path_params.get("symbol", "")
+    try:
+        position = trade_client.get_open_position(symbol)
+    except APIError as exc:
+        status = getattr(exc, "status_code", None) or 404
+        return JSONResponse({"error": str(exc)}, status_code=404 if status == 404 else 502)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(position))
+
+
+async def _bridge_watchlists(request: Request) -> JSONResponse:
+    _ensure_clients()
+    try:
+        watchlists = trade_client.get_watchlists()
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(watchlists))
+
+
+def _find_watchlist_by_name(name: str):
+    """Locate a watchlist by name (case-insensitive) using the Alpaca SDK."""
+    watchlists = trade_client.get_watchlists()
+    target = name.strip().lower()
+    for wl in watchlists:
+        wl_name = getattr(wl, "name", "") or ""
+        if wl_name.lower() == target:
+            return wl
+    return None
+
+
+async def _bridge_watchlist_by_id(request: Request) -> JSONResponse:
+    _ensure_clients()
+    watchlist_id = request.path_params.get("watchlist_id", "")
+    try:
+        wl = trade_client.get_watchlist_by_id(watchlist_id)
+    except APIError as exc:
+        status = getattr(exc, "status_code", None) or 404
+        return JSONResponse({"error": str(exc)}, status_code=404 if status == 404 else 502)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(wl))
+
+
+async def _bridge_watchlist_by_name(request: Request) -> JSONResponse:
+    _ensure_clients()
+    name = request.path_params.get("watchlist_name", "")
+    try:
+        wl = _find_watchlist_by_name(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if wl is None:
+        return JSONResponse({"error": f"Watchlist '{name}' not found"}, status_code=404)
+    return JSONResponse(_serialize(wl))
+
+
+def _extract_symbols_from_watchlist(wl) -> list[str]:
+    symbols: list[str] = []
+    assets = getattr(wl, "assets", None) or []
+    for asset in assets:
+        symbol = getattr(asset, "symbol", None)
+        if symbol:
+            symbols.append(symbol)
+    return sorted(symbols)
+
+
+async def _bridge_watchlist_symbols(request: Request) -> JSONResponse:
+    _ensure_clients()
+    watchlist_id = request.path_params.get("watchlist_id", "")
+    try:
+        wl = trade_client.get_watchlist_by_id(watchlist_id)
+    except APIError as exc:
+        status = getattr(exc, "status_code", None) or 404
+        return JSONResponse({"error": str(exc)}, status_code=404 if status == 404 else 502)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    payload = {"id": watchlist_id, "name": getattr(wl, "name", ""), "symbols": _extract_symbols_from_watchlist(wl)}
+    return JSONResponse(payload)
+
+
+async def _bridge_watchlist_symbols_by_name(request: Request) -> JSONResponse:
+    _ensure_clients()
+    name = request.path_params.get("watchlist_name", "")
+    try:
+        wl = _find_watchlist_by_name(name)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if wl is None:
+        return JSONResponse({"error": f"Watchlist '{name}' not found"}, status_code=404)
+    payload = {"id": getattr(wl, "id", None), "name": getattr(wl, "name", ""), "symbols": _extract_symbols_from_watchlist(wl)}
+    return JSONResponse(payload)
+
+
+async def _bridge_orders(request: Request) -> JSONResponse:
+    _ensure_clients()
+    query = request.query_params
+    status_param = query.get("status")
+    if status_param:
+        status_param = status_param.upper()
+    limit_param = query.get("limit")
+    limit: int | None = None
+    try:
+        if limit_param is not None:
+            limit = int(limit_param)
+    except ValueError:
+        limit = None
+    symbols_raw = query.get("symbols")
+    symbols_list = None
+    if symbols_raw:
+        symbols_list = [sym.strip() for sym in symbols_raw.split(",") if sym.strip()]
+    try:
+        request_model = GetOrdersRequest()
+        if status_param:
+            request_model.status = status_param
+        if limit:
+            request_model.limit = limit
+        if symbols_list:
+            request_model.symbols = symbols_list
+        orders = trade_client.get_orders(request_model)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(orders))
+
+
+async def _bridge_submit_order(request: Request) -> JSONResponse:
+    _ensure_clients()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body required"}, status_code=400)
+    try:
+        order = trade_client.submit_order(order_data=body)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(order), status_code=201)
+
+
+async def _bridge_latest_quote(request: Request) -> JSONResponse:
+    _ensure_clients()
+    symbol = (request.path_params.get("symbol") or "").upper()
+    if not symbol:
+        return JSONResponse({"error": "Symbol is required"}, status_code=400)
+    try:
+        quote = stock_historical_data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return JSONResponse(_serialize(quote))
+
+
+_BRIDGE_ROUTES = [
+    Route("/account", endpoint=_bridge_account, methods=["GET"]),
+    Route("/positions", endpoint=_bridge_positions, methods=["GET"]),
+    Route("/positions/{symbol}", endpoint=_bridge_position_by_symbol, methods=["GET"]),
+    Route("/orders", endpoint=_bridge_orders, methods=["GET"]),
+    Route("/orders", endpoint=_bridge_submit_order, methods=["POST"]),
+    Route("/watchlists", endpoint=_bridge_watchlists, methods=["GET"]),
+    Route("/watchlists/{watchlist_id}", endpoint=_bridge_watchlist_by_id, methods=["GET"]),
+    Route("/watchlists/by-name/{watchlist_name}", endpoint=_bridge_watchlist_by_name, methods=["GET"]),
+    Route("/watchlists/{watchlist_id}/symbols", endpoint=_bridge_watchlist_symbols, methods=["GET"]),
+    Route("/watchlists/by-name/{watchlist_name}/symbols", endpoint=_bridge_watchlist_symbols_by_name, methods=["GET"]),
+    Route("/stocks/{symbol}/quotes/latest", endpoint=_bridge_latest_quote, methods=["GET"]),
+    # Support the Alpaca REST-style /v2 prefix to align with Ops-Hub client settings.
+    Route("/v2/account", endpoint=_bridge_account, methods=["GET"]),
+    Route("/v2/positions", endpoint=_bridge_positions, methods=["GET"]),
+    Route("/v2/positions/{symbol}", endpoint=_bridge_position_by_symbol, methods=["GET"]),
+    Route("/v2/orders", endpoint=_bridge_orders, methods=["GET"]),
+    Route("/v2/orders", endpoint=_bridge_submit_order, methods=["POST"]),
+    Route("/v2/watchlists", endpoint=_bridge_watchlists, methods=["GET"]),
+    Route("/v2/watchlists/{watchlist_id}", endpoint=_bridge_watchlist_by_id, methods=["GET"]),
+    Route("/v2/watchlists/by-name/{watchlist_name}", endpoint=_bridge_watchlist_by_name, methods=["GET"]),
+    Route("/v2/watchlists/{watchlist_id}/symbols", endpoint=_bridge_watchlist_symbols, methods=["GET"]),
+    Route("/v2/watchlists/by-name/{watchlist_name}/symbols", endpoint=_bridge_watchlist_symbols_by_name, methods=["GET"]),
+    Route("/v2/stocks/{symbol}/quotes/latest", endpoint=_bridge_latest_quote, methods=["GET"]),
+]
 
 # ============================================================================
 # Account and Positions Tools
