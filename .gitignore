@@ -7,6 +7,7 @@ secret.py
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
 *.so
 .Python
 env/
@@ -31,3 +32,5 @@ Thumbs.db
 
 # Project-specific
 _collection/
+artifacts/
+local/
