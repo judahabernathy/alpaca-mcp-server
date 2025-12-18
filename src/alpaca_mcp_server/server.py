@@ -90,6 +90,8 @@ from alpaca.trading.requests import (
     StopOrderRequest,
     TrailingStopOrderRequest,
     UpdateWatchlistRequest,
+    TakeProfitRequest,
+    StopLossRequest,
 )
 
 
@@ -137,6 +139,7 @@ except ImportError:
     )
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 import contextvars
 
 # Context variable to store Authorization header from incoming HTTP requests
@@ -194,6 +197,8 @@ log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
 mcp = FastMCP(
     "alpaca-trading",
     log_level=log_level,
+    # Prevent host header rejections behind Railway; service already gated by auth.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     # Stateless + JSON responses so MCP clients don't need session headers or SSE Accept.
     stateless_http=True,
     json_response=True,
@@ -2611,10 +2616,14 @@ async def place_stock_order(
     time_in_force: str = "day",
     limit_price: float = None,
     stop_price: float = None,
+    take_profit_price: float = None,
     trail_price: float = None,
     trail_percent: float = None,
     extended_hours: bool = False,
-    client_order_id: str = None
+    client_order_id: str = None,
+    order_class: Optional[Union[str, OrderClass]] = None,
+    take_profit: Optional[Dict[str, Any]] = None,
+    stop_loss: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Places an order of any supported type (MARKET, LIMIT, STOP, STOP_LIMIT, TRAILING_STOP) using the correct Alpaca request class.
@@ -2670,6 +2679,41 @@ async def place_stock_order(
         else:
             return f"Invalid time_in_force type: {type(time_in_force)}. Must be string or TimeInForce enum."
 
+        # Normalize/validate order_class and bracket legs
+        tp_req = None
+        sl_req = None
+        if isinstance(order_class, str) or isinstance(order_class, OrderClass) or take_profit or stop_loss:
+            converted = _convert_order_class_string(order_class)
+            if isinstance(converted, str) and not isinstance(converted, OrderClass):
+                return converted
+            order_class_enum = converted if isinstance(converted, OrderClass) else None
+        else:
+            order_class_enum = None
+
+        # If caller sent take_profit/stop_loss dicts, build requests and default order_class to bracket
+        if take_profit:
+            tp_price = take_profit.get("limit_price") or take_profit.get("price") or take_profit.get("limit")
+            if tp_price is None:
+                return "take_profit.limit_price is required when take_profit is provided."
+            tp_req = TakeProfitRequest(limit_price=tp_price)
+            order_class_enum = order_class_enum or OrderClass.BRACKET
+        if stop_loss:
+            sl_stop = stop_loss.get("stop_price") or stop_loss.get("stop") or stop_loss.get("price")
+            sl_limit = stop_loss.get("limit_price") or stop_loss.get("limit")
+            if sl_stop is None:
+                return "stop_loss.stop_price is required when stop_loss is provided."
+            sl_req = StopLossRequest(stop_price=sl_stop, limit_price=sl_limit)
+            order_class_enum = order_class_enum or OrderClass.BRACKET
+
+        # Backward compat: if no explicit stop_loss but stop_price provided alongside take_profit, treat as bracket
+        if not sl_req and stop_price is not None and (take_profit or take_profit_price):
+            sl_req = StopLossRequest(stop_price=stop_price)
+            order_class_enum = order_class_enum or OrderClass.BRACKET
+        # Allow top-level take_profit_price without take_profit dict
+        if not tp_req and take_profit_price is not None:
+            tp_req = TakeProfitRequest(limit_price=take_profit_price)
+            order_class_enum = order_class_enum or OrderClass.BRACKET
+
         # Validate order_type
         order_type_upper = order_type.upper()
         if order_type_upper == "MARKET":
@@ -2680,7 +2724,10 @@ async def place_stock_order(
                 type=OrderType.MARKET,
                 time_in_force=tif_enum,
                 extended_hours=extended_hours,
-                client_order_id=client_order_id or f"order_{int(time.time())}"
+                client_order_id=client_order_id or f"order_{int(time.time())}",
+                order_class=order_class_enum or OrderClass.SIMPLE,
+                take_profit=tp_req,
+                stop_loss=sl_req,
             )
         elif order_type_upper == "LIMIT":
             if limit_price is None:
@@ -2693,7 +2740,10 @@ async def place_stock_order(
                 time_in_force=tif_enum,
                 limit_price=limit_price,
                 extended_hours=extended_hours,
-                client_order_id=client_order_id or f"order_{int(time.time())}"
+                client_order_id=client_order_id or f"order_{int(time.time())}",
+                order_class=order_class_enum or OrderClass.SIMPLE,
+                take_profit=tp_req,
+                stop_loss=sl_req,
             )
         elif order_type_upper == "STOP":
             if stop_price is None:
