@@ -3144,17 +3144,34 @@ async def cancel_order_by_id(order_id: str) -> str:
     try:
         # Cancel the specific order
         response = trade_client.cancel_order_by_id(order_id)
-        
+        if response is None:
+            status_value = None
+            try:
+                order = trade_client.get_order_by_id(order_id)
+                status_value = getattr(order, "status", None)
+            except Exception:
+                status_value = None
+            result = f"""
+        Order Cancellation Result:
+        ------------------------
+        Order ID: {order_id}
+        Status: {status_value or "submitted"}
+        """
+            if status_value is None:
+                result += "Details: Cancel request returned no response; verify order status.\n"
+            return result
+
         # Format the response
         status = "Success" if response.status == 200 else "Failed"
+        response_id = getattr(response, "id", None) or order_id
         result = f"""
         Order Cancellation Result:
         ------------------------
-        Order ID: {response.id}
+        Order ID: {response_id}
         Status: {status}
         """
         
-        if response.body:
+        if getattr(response, "body", None):
             result += f"Details: {response.body}\n"
             
         return result
