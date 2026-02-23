@@ -637,9 +637,12 @@ async def get_account_info() -> str:
     _ensure_clients()
     account = trade_client.get_account()
     
+    trading_env = "paper" if ALPACA_PAPER_TRADE_BOOL else "live"
     info = f"""
             Account Information:
             -------------------
+            Trading Environment: {trading_env}
+            Paper Trading Mode: {'Yes' if ALPACA_PAPER_TRADE_BOOL else 'No'}
             Account ID: {account.id}
             Status: {account.status}
             Currency: {account.currency}
