@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Union, Tuple
 
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, OrderType, TimeInForce
 from alpaca.trading.models import Order
 from alpaca.trading.requests import MarketOrderRequest, OptionLegRequest
 
@@ -490,5 +490,4 @@ def _handle_option_api_error(error_message: str, order_legs: List[OptionLegReque
         3. The market is open for trading
         4. Your account has the required permissions
         """
-
 
