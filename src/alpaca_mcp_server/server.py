@@ -41,7 +41,9 @@ from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.requests import (
+    OptionBarsRequest,
     OptionLatestQuoteRequest,
+    OptionTradesRequest,
     OptionSnapshotRequest,
     Sort,
     StockBarsRequest,
@@ -2264,6 +2266,117 @@ async def get_option_contracts(
         
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+@mcp.tool()
+async def get_option_bars(
+    symbol: str,
+    days: int = 7,
+    timeframe: str = "1Day",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: Optional[int] = 1000,
+    sort: Optional[Sort] = Sort.ASC,
+    feed: Optional[OptionsFeed] = None,
+) -> str:
+    """
+    Retrieves and formats historical bars for an option contract.
+
+    Args:
+        symbol (str): Option contract symbol.
+        days (int): Lookback days when `start` is omitted.
+        timeframe (str): Bar timeframe (e.g., 1Min, 5Min, 1Hour, 1Day).
+        start/end (Optional[str]): ISO timestamps.
+        limit (Optional[int]): Max bars to return.
+        sort (Optional[Sort]): ASC or DESC.
+        feed (Optional[OptionsFeed]): opra or indicative.
+    """
+    _ensure_clients()
+    try:
+        timeframe_obj = parse_timeframe_with_enums(timeframe)
+        if timeframe_obj is None:
+            return f"Error: Invalid timeframe '{timeframe}'."
+
+        if start:
+            start_time = _parse_iso_datetime(start)
+        else:
+            start_time = datetime.now() - timedelta(days=max(1, int(days)))
+
+        if end:
+            end_time = _parse_iso_datetime(end)
+        else:
+            end_time = datetime.now()
+
+        request = OptionBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=timeframe_obj,
+            start=start_time,
+            end=end_time,
+            limit=limit,
+            sort=sort,
+            feed=feed,
+        )
+        bars = option_historical_data_client.get_option_bars(request)
+        if symbol not in bars or not bars[symbol]:
+            return f"No option bars found for {symbol} in the specified range."
+
+        result = [f"Historical Option Bars for {symbol} ({timeframe}):", "-" * 60]
+        for bar in bars[symbol]:
+            result.append(
+                f"{bar.timestamp} | O:{float(bar.open):.4f} H:{float(bar.high):.4f} "
+                f"L:{float(bar.low):.4f} C:{float(bar.close):.4f} V:{bar.volume}"
+            )
+        return "\n".join(result)
+    except Exception as e:
+        return f"Error fetching option bars: {str(e)}"
+
+
+@mcp.tool()
+async def get_option_trades(
+    symbol: str,
+    days: int = 1,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: Optional[int] = 1000,
+    sort: Optional[Sort] = Sort.ASC,
+    feed: Optional[OptionsFeed] = None,
+) -> str:
+    """
+    Retrieves and formats historical trades for an option contract.
+    """
+    _ensure_clients()
+    try:
+        if start:
+            start_time = _parse_iso_datetime(start)
+        else:
+            start_time = datetime.now() - timedelta(days=max(1, int(days)))
+        if end:
+            end_time = _parse_iso_datetime(end)
+        else:
+            end_time = datetime.now()
+
+        request = OptionTradesRequest(
+            symbol_or_symbols=symbol,
+            start=start_time,
+            end=end_time,
+            limit=limit,
+            sort=sort,
+            feed=feed,
+        )
+        trades = option_historical_data_client.get_option_trades(request)
+        if symbol not in trades or not trades[symbol]:
+            return f"No option trades found for {symbol} in the specified range."
+
+        result = [f"Historical Option Trades for {symbol}:", "-" * 60]
+        for trade in trades[symbol]:
+            result.append(
+                f"{trade.timestamp} | Price:{float(trade.price):.4f} Size:{trade.size} "
+                f"Exchange:{getattr(trade, 'exchange', '')} Conditions:{getattr(trade, 'conditions', '')}"
+            )
+        return "\n".join(result)
+    except Exception as e:
+        return f"Error fetching option trades: {str(e)}"
+
 
 @mcp.tool()
 async def get_option_latest_quote(
