@@ -1,0 +1,14 @@
+# Project-scoped Codex configuration for Alpaca MCP Server.
+# Keep credentials, provider auth, host paths, and notification commands in the user-level config.
+
+project_doc_max_bytes = 65536
+
+instructions = """
+This GitHub-backed codex-swing repository is prepared for Codex local, app, SSH remote, and cloud workflows.
+
+- Treat the GitHub origin as the canonical source of truth.
+- Load and follow AGENTS.md before changing files.
+- Use .codex/README.md for setup, verification, and common action commands.
+- Keep Alpaca credentials, Railway tokens, account data, API keys, and local vault contents out of git.
+- Commit and push this repo before updating any SwingGPT-ops submodule pointer.
+"""
